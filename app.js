@@ -145,6 +145,10 @@ async function main() {
   console.log(`Saved: ${outputPathGroup}`);
 }
 
-main().catch((err) => {
-  console.error('Error:', err);
-});
+module.exports = { getBaseName, checkIPv6Enabled, groupByIPv4, P2P, STREAMING, IPV6 };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Error:', err);
+  });
+}
