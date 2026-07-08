@@ -1,6 +1,6 @@
-const { describe, it } = require('node:test');
+const { describe, it, beforeEach, afterEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
-const { getBaseName, checkIPv6Enabled, groupByIPv4, isExcludedCountry, dedupeServers, extractFeatures, sortByCity, P2P, STREAMING, IPV6 } = require('./app');
+const { getBaseName, checkIPv6Enabled, groupByIPv4, isExcludedCountry, dedupeServers, extractFeatures, sortByCity, resolveDomain, _resetDnsCache, main, P2P, STREAMING, IPV6 } = require('./app');
 
 describe('getBaseName', () => {
   it('extracts base name before #', () => {
@@ -413,5 +413,252 @@ describe('sortByCity', () => {
     const entries = [];
     sortByCity(entries);
     assert.deepEqual(entries, []);
+  });
+});
+
+describe('resolveDomain', () => {
+  const dns = require('dns').promises;
+  let resolve4Mock;
+  let resolve6Mock;
+
+  beforeEach(() => {
+    _resetDnsCache();
+    resolve4Mock = mock.method(dns, 'resolve4', async () => ['1.2.3.4']);
+    resolve6Mock = mock.method(dns, 'resolve6', async () => []);
+  });
+
+  afterEach(() => {
+    resolve4Mock.mock.restore();
+    resolve6Mock.mock.restore();
+    _resetDnsCache();
+  });
+
+  it('resolves A and AAAA records for a domain', async () => {
+    const result = await resolveDomain('test.protonvpn.net');
+    assert.equal(result.domain, 'test.protonvpn.net');
+    assert.deepEqual(result.ipv4, ['1.2.3.4']);
+    assert.deepEqual(result.ipv6, []);
+  });
+
+  it('returns cached result on second call without hitting DNS again', async () => {
+    await resolveDomain('cached.protonvpn.net');
+    await resolveDomain('cached.protonvpn.net');
+    assert.equal(resolve4Mock.mock.callCount(), 1);
+    assert.equal(resolve6Mock.mock.callCount(), 1);
+  });
+
+  it('returns empty ipv4 when A record lookup fails', async () => {
+    resolve4Mock.mock.mockImplementation(async () => { throw new Error('ENOTFOUND'); });
+    resolve6Mock.mock.mockImplementation(async () => ['::1']);
+    const result = await resolveDomain('no-a.protonvpn.net');
+    assert.deepEqual(result.ipv4, []);
+    assert.deepEqual(result.ipv6, ['::1']);
+  });
+
+  it('returns empty ipv6 when AAAA record lookup fails', async () => {
+    resolve6Mock.mock.mockImplementation(async () => { throw new Error('ENOTFOUND'); });
+    const result = await resolveDomain('no-aaaa.protonvpn.net');
+    assert.deepEqual(result.ipv4, ['1.2.3.4']);
+    assert.deepEqual(result.ipv6, []);
+  });
+
+  it('returns both empty arrays when all DNS lookups fail', async () => {
+    resolve4Mock.mock.mockImplementation(async () => { throw new Error('ENOTFOUND'); });
+    resolve6Mock.mock.mockImplementation(async () => { throw new Error('ENOTFOUND'); });
+    const result = await resolveDomain('no-dns.protonvpn.net');
+    assert.deepEqual(result.ipv4, []);
+    assert.deepEqual(result.ipv6, []);
+    assert.equal(result.domain, 'no-dns.protonvpn.net');
+  });
+
+  it('handles multiple A records', async () => {
+    resolve4Mock.mock.mockImplementation(async () => ['1.1.1.1', '2.2.2.2']);
+    const result = await resolveDomain('multi-a.protonvpn.net');
+    assert.deepEqual(result.ipv4, ['1.1.1.1', '2.2.2.2']);
+  });
+});
+
+describe('main', () => {
+  const dns = require('dns').promises;
+  const fs = require('fs');
+  let resolve4Mock;
+  let resolve6Mock;
+  let existsSyncMock;
+  let mkdirSyncMock;
+  let readFileSyncMock;
+  let writeFileSyncMock;
+  const writtenFiles = {};
+
+  beforeEach(() => {
+    _resetDnsCache();
+    writtenFiles.files = {};
+    resolve4Mock = mock.method(dns, 'resolve4', async (domain) => {
+      if (domain.includes('us-')) return ['10.0.0.1'];
+      if (domain.includes('ch-')) return ['10.0.0.2'];
+      return ['10.0.0.3'];
+    });
+    resolve6Mock = mock.method(dns, 'resolve6', async () => []);
+    existsSyncMock = mock.method(fs, 'existsSync', () => true);
+    mkdirSyncMock = mock.method(fs, 'mkdirSync', () => undefined);
+    readFileSyncMock = mock.method(fs, 'readFileSync', () => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 4,
+          Servers: [
+            { Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' }
+          ]
+        },
+        {
+          Name: 'JP#1',
+          Domain: 'jp-1.protonvpn.net',
+          City: 'Tokyo',
+          Features: 0,
+          Servers: [
+            { Domain: 'jp-1s.protonvpn.net', X25519PublicKey: 'k2', EntryIP: '10.0.0.3', ExitIP: '10.0.0.3' }
+          ]
+        }
+      ]
+    }));
+    writeFileSyncMock = mock.method(fs, 'writeFileSync', (p, content) => {
+      writtenFiles.files[p] = content;
+    });
+  });
+
+  afterEach(() => {
+    resolve4Mock.mock.restore();
+    resolve6Mock.mock.restore();
+    existsSyncMock.mock.restore();
+    mkdirSyncMock.mock.restore();
+    readFileSyncMock.mock.restore();
+    writeFileSyncMock.mock.restore();
+    _resetDnsCache();
+  });
+
+  it('creates output directories when they do not exist', async () => {
+    existsSyncMock.mock.mockImplementation(() => false);
+    await main();
+    assert.ok(mkdirSyncMock.mock.callCount() >= 2);
+  });
+
+  it('skips mkdir when output directories already exist', async () => {
+    existsSyncMock.mock.mockImplementation(() => true);
+    await main();
+    assert.equal(mkdirSyncMock.mock.callCount(), 0);
+  });
+
+  it('writes per-baseName JSON files', async () => {
+    await main();
+    const paths = Object.keys(writtenFiles.files);
+    const usPath = paths.find(p => p.includes('US.json'));
+    const jpPath = paths.find(p => p.includes('JP.json'));
+    assert.ok(usPath, 'US.json should be written');
+    assert.ok(jpPath, 'JP.json should be written');
+  });
+
+  it('excludes Secure Core entries (SE-, CH-, IS-) from all.json', async () => {
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'CH-US#1',
+          Domain: 'ch-us-1.protonvpn.net',
+          City: 'Zurich',
+          Features: 0,
+          Servers: [{ Domain: 'ch-us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.2', ExitIP: '10.0.0.2' }]
+        },
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 0,
+          Servers: [{ Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k2', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' }]
+        }
+      ]
+    }));
+    await main();
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    assert.ok(allJsonPath);
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    const names = allData.data.flatMap(d => d.servers);
+    assert.ok(!names.includes('CH-US#1'), 'Secure Core entry should be excluded from all.json');
+    assert.ok(names.includes('US#1'), 'Regular entry should be in all.json');
+  });
+
+  it('includes genDate in all.json output', async () => {
+    await main();
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    assert.ok(allJsonPath);
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    assert.ok(allData.genDate, 'genDate should be present');
+    assert.ok(new Date(allData.genDate).toISOString() === allData.genDate, 'genDate should be valid ISO string');
+  });
+
+  it('deduplicates servers within a logical server entry', async () => {
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'NYC',
+          Features: 0,
+          Servers: [
+            { Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' },
+            { Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' }
+          ]
+        }
+      ]
+    }));
+    await main();
+    const usPath = Object.keys(writtenFiles.files).find(p => p.includes('US.json'));
+    const usData = JSON.parse(writtenFiles.files[usPath]);
+    assert.equal(usData[0].Servers.length, 1);
+  });
+
+  it('extracts P2P and Streaming feature flags correctly', async () => {
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'NYC',
+          Features: 4 | 8,
+          Servers: [{ Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' }]
+        }
+      ]
+    }));
+    await main();
+    const usPath = Object.keys(writtenFiles.files).find(p => p.includes('US.json'));
+    const usData = JSON.parse(writtenFiles.files[usPath]);
+    assert.equal(usData[0].P2P, true);
+    assert.equal(usData[0].Streaming, true);
+  });
+
+  it('sorts all.json data by city', async () => {
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'JP#1',
+          Domain: 'jp-1.protonvpn.net',
+          City: 'Tokyo',
+          Features: 0,
+          Servers: [{ Domain: 'jp-1s.protonvpn.net', X25519PublicKey: 'k2', EntryIP: '10.0.0.3', ExitIP: '10.0.0.3' }]
+        },
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'Atlanta',
+          Features: 0,
+          Servers: [{ Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' }]
+        }
+      ]
+    }));
+    await main();
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    assert.ok(allData.data.length >= 2);
+    assert.equal(allData.data[0].city, 'Atlanta');
+    assert.equal(allData.data[1].city, 'Tokyo');
   });
 });

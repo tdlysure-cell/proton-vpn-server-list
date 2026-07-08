@@ -161,7 +161,13 @@ async function main() {
   console.log(`Saved: ${outputPathGroup}`);
 }
 
-module.exports = { getBaseName, checkIPv6Enabled, groupByIPv4, isExcludedCountry, dedupeServers, extractFeatures, sortByCity, P2P, STREAMING, IPV6 };
+function _resetDnsCache() {
+  for (const key of Object.keys(dnsCache)) {
+    delete dnsCache[key];
+  }
+}
+
+module.exports = { getBaseName, checkIPv6Enabled, groupByIPv4, isExcludedCountry, dedupeServers, extractFeatures, sortByCity, resolveDomain, _resetDnsCache, main, P2P, STREAMING, IPV6 };
 
 if (require.main === module) {
   main().catch((err) => {
