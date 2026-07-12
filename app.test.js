@@ -777,4 +777,116 @@ describe('main', () => {
     const baseNameFiles = Object.keys(writtenFiles.files).filter(p => !p.includes('all.json'));
     assert.equal(baseNameFiles.length, 0);
   });
+
+  it('writes entry with empty Servers array when logical server has no physical servers', async () => {
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 0,
+          Servers: []
+        }
+      ]
+    }));
+    await main();
+    const usPath = Object.keys(writtenFiles.files).find(p => p.includes('US.json'));
+    assert.ok(usPath);
+    const usData = JSON.parse(writtenFiles.files[usPath]);
+    assert.equal(usData[0].Servers.length, 0, 'entry should have empty Servers array');
+    assert.equal(usData[0].ipv6Enabled, false, 'ipv6Enabled should be false with no servers');
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    assert.deepEqual(allData.data, [], 'entry with no physical servers should not appear in all.json');
+  });
+
+  it('preserves X25519PublicKey, EntryIP, and ExitIP in server output', async () => {
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 0,
+          Servers: [
+            { Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'pubkey123', EntryIP: '10.0.0.1', ExitIP: '10.0.0.2' }
+          ]
+        }
+      ]
+    }));
+    await main();
+    const usPath = Object.keys(writtenFiles.files).find(p => p.includes('US.json'));
+    const usData = JSON.parse(writtenFiles.files[usPath]);
+    const server = usData[0].Servers[0];
+    assert.equal(server.X25519PublicKey, 'pubkey123');
+    assert.equal(server.EntryIP, '10.0.0.1');
+    assert.equal(server.ExitIP, '10.0.0.2');
+    assert.equal(server.Domain, 'us-1s.protonvpn.net');
+    assert.deepEqual(server.ipv4, ['10.0.0.1']);
+  });
+
+  it('stores resolved domain object (with ipv4/ipv6) as Domain field in output entry', async () => {
+    resolve4Mock.mock.mockImplementation(async (domain) => {
+      return domain === 'us-1.protonvpn.net' ? ['10.0.0.1'] : ['10.0.0.10'];
+    });
+    resolve6Mock.mock.mockImplementation(async (domain) => {
+      return domain === 'us-1.protonvpn.net' ? ['2001:db8::1'] : [];
+    });
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 0,
+          Servers: [
+            { Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.10', ExitIP: '10.0.0.10' }
+          ]
+        }
+      ]
+    }));
+    await main();
+    const usPath = Object.keys(writtenFiles.files).find(p => p.includes('US.json'));
+    const usData = JSON.parse(writtenFiles.files[usPath]);
+    assert.equal(usData[0].Domain.domain, 'us-1.protonvpn.net');
+    assert.deepEqual(usData[0].Domain.ipv4, ['10.0.0.1']);
+    assert.deepEqual(usData[0].Domain.ipv6, ['2001:db8::1']);
+    assert.equal(usData[0].ipv6Enabled, true, 'ipv6Enabled should be true when domain has AAAA');
+  });
+
+  it('resolves and includes all physical servers when a logical has multiple', async () => {
+    resolve4Mock.mock.mockImplementation(async (domain) => {
+      if (domain === 'us-1a.protonvpn.net') return ['10.0.0.1'];
+      if (domain === 'us-1b.protonvpn.net') return ['10.0.0.2'];
+      return ['10.0.0.3'];
+    });
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 0,
+          Servers: [
+            { Domain: 'us-1a.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.1' },
+            { Domain: 'us-1b.protonvpn.net', X25519PublicKey: 'k2', EntryIP: '10.0.0.2', ExitIP: '10.0.0.2' }
+          ]
+        }
+      ]
+    }));
+    await main();
+    const usPath = Object.keys(writtenFiles.files).find(p => p.includes('US.json'));
+    const usData = JSON.parse(writtenFiles.files[usPath]);
+    assert.equal(usData[0].Servers.length, 2, 'both physical servers should be present');
+    assert.deepEqual(usData[0].Servers[0].ipv4, ['10.0.0.1']);
+    assert.deepEqual(usData[0].Servers[1].ipv4, ['10.0.0.2']);
+    assert.equal(usData[0].Servers[0].Domain, 'us-1a.protonvpn.net');
+    assert.equal(usData[0].Servers[1].Domain, 'us-1b.protonvpn.net');
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    assert.equal(allData.data.length, 2, 'each physical server IP should appear in all.json');
+    assert.deepEqual(allData.data[0].servers, ['US#1']);
+    assert.deepEqual(allData.data[1].servers, ['US#1']);
+  });
 });
