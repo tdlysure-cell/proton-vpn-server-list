@@ -1,5 +1,6 @@
 const { describe, it, beforeEach, afterEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('path');
 const { getBaseName, checkIPv6Enabled, groupByIPv4, isExcludedCountry, dedupeServers, extractFeatures, sortByCity, resolveDomain, _resetDnsCache, main, P2P, STREAMING, IPV6 } = require('./app');
 
 describe('getBaseName', () => {
@@ -241,6 +242,45 @@ describe('groupByIPv4', () => {
     // First IPv6 from the server is used for first IP group
     assert.equal(result[0].ipv6, '::1');
     assert.equal(result[1].ipv6, '::1');
+  });
+
+  it('sets domain to the physical server Domain for the grouped IP', () => {
+    const entry = {
+      Name: 'US#1',
+      Domain: { domain: 'us-1.protonvpn.net', ipv4: [], ipv6: [] },
+      City: 'New York',
+      ipv6Enabled: false,
+      Servers: [{ Domain: 'node-us-01.protonvpn.net', ipv4: ['1.2.3.4'], ipv6: [], X25519PublicKey: 'k1', EntryIP: '1.2.3.4', ExitIP: '1.2.3.4' }],
+      P2P: false,
+      Streaming: false
+    };
+    const result = groupByIPv4([entry]);
+    assert.equal(result[0].domain, 'node-us-01.protonvpn.net');
+  });
+
+  it('keeps the first server Domain when multiple entries share an IPv4', () => {
+    const entry1 = {
+      Name: 'US#1',
+      Domain: { domain: 'us-1.protonvpn.net', ipv4: [], ipv6: [] },
+      City: 'New York',
+      ipv6Enabled: false,
+      Servers: [{ Domain: 'node-us-01.protonvpn.net', ipv4: ['1.2.3.4'], ipv6: [], X25519PublicKey: 'k1', EntryIP: '1.2.3.4', ExitIP: '1.2.3.4' }],
+      P2P: false,
+      Streaming: false
+    };
+    const entry2 = {
+      Name: 'US#2',
+      Domain: { domain: 'us-2.protonvpn.net', ipv4: [], ipv6: [] },
+      City: 'New York',
+      ipv6Enabled: false,
+      Servers: [{ Domain: 'node-us-02.protonvpn.net', ipv4: ['1.2.3.4'], ipv6: [], X25519PublicKey: 'k2', EntryIP: '1.2.3.4', ExitIP: '1.2.3.4' }],
+      P2P: false,
+      Streaming: false
+    };
+    const result = groupByIPv4([entry1, entry2]);
+    assert.equal(result.length, 1);
+    // First-entry metadata wins for the shared IP, including the domain
+    assert.equal(result[0].domain, 'node-us-01.protonvpn.net');
   });
 });
 
@@ -888,5 +928,26 @@ describe('main', () => {
     assert.equal(allData.data.length, 2, 'each physical server IP should appear in all.json');
     assert.deepEqual(allData.data[0].servers, ['US#1']);
     assert.deepEqual(allData.data[1].servers, ['US#1']);
+  });
+
+  it('writes all.json to the output-group directory (path the S3 workflow depends on)', async () => {
+    await main();
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    assert.ok(allJsonPath, 'all.json should be written');
+    assert.equal(allJsonPath, path.join('output-group', 'all.json'));
+  });
+
+  it('writes per-baseName files into the outputs directory', async () => {
+    await main();
+    const baseNameFiles = Object.keys(writtenFiles.files).filter(p => !p.includes('all.json'));
+    assert.ok(baseNameFiles.length > 0, 'per-baseName files should be written');
+    for (const p of baseNameFiles) {
+      assert.ok(p.startsWith('outputs' + path.sep), `${p} should be inside outputs/`);
+    }
+  });
+
+  it('rejects when the input file is not valid JSON (errors are not silently swallowed)', async () => {
+    readFileSyncMock.mock.mockImplementation(() => 'not-valid-json{');
+    await assert.rejects(main(), SyntaxError);
   });
 });
