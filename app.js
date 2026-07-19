@@ -44,6 +44,31 @@ function checkIPv6Enabled(domainResult, servers) {
   return false;
 }
 
+function isExcludedCountry(name) {
+  return name.startsWith('SE-') || name.startsWith('CH-') || name.startsWith('IS-');
+}
+
+function dedupeServers(servers) {
+  return [...new Set(servers.map(r => JSON.stringify(r)))].map(r => JSON.parse(r));
+}
+
+function extractFeatures(features) {
+  return {
+    P2P: (features & P2P) !== 0,
+    Streaming: (features & STREAMING) !== 0,
+  };
+}
+
+function sortByCity(entries) {
+  return entries.sort((a, b) => {
+    const cityA = (a.city || '').toLowerCase();
+    const cityB = (b.city || '').toLowerCase();
+    if (cityA < cityB) return -1;
+    if (cityA > cityB) return 1;
+    return 0;
+  });
+}
+
 function groupByIPv4(allEntries) {
   const map = new Map();
 
@@ -108,15 +133,12 @@ async function main() {
       Domain: resolvedDomain,
       City: logical.City || null,
       ipv6Enabled,
-      Servers: [...new Set(servers.map(r => JSON.stringify(r)))].map(r => JSON.parse(r)),
-      P2P: ((logical.Features & P2P) !== 0)?true:false,
-      Streaming: ((logical.Features & STREAMING) !== 0)?true:false
+      Servers: dedupeServers(servers),
+      ...extractFeatures(logical.Features)
     };
 
     grouped[baseName].push(entryObj);
-    if (!entryObj.Name.startsWith("SE-") 
-    && !entryObj.Name.startsWith("CH-") 
-    && !entryObj.Name.startsWith("IS-") ) allEntries.push(entryObj);
+    if (!isExcludedCountry(entryObj.Name)) allEntries.push(entryObj);
   }
 
   // Write grouped-by-baseName JSON
@@ -128,13 +150,7 @@ async function main() {
 
   // Create grouped-by-IPv4 JSON
   const ipv4Grouped = groupByIPv4(allEntries);
-  ipv4Grouped.sort((a, b) => {
-    const cityA = (a.city || "").toLowerCase();
-    const cityB = (b.city || "").toLowerCase();
-    if (cityA < cityB) return -1;
-    if (cityA > cityB) return 1;
-    return 0;
-  });
+  sortByCity(ipv4Grouped);
   const outputData = {
     genDate: new Date().toISOString(),
     data: ipv4Grouped,
@@ -145,6 +161,16 @@ async function main() {
   console.log(`Saved: ${outputPathGroup}`);
 }
 
-main().catch((err) => {
-  console.error('Error:', err);
-});
+function _resetDnsCache() {
+  for (const key of Object.keys(dnsCache)) {
+    delete dnsCache[key];
+  }
+}
+
+module.exports = { getBaseName, checkIPv6Enabled, groupByIPv4, isExcludedCountry, dedupeServers, extractFeatures, sortByCity, resolveDomain, _resetDnsCache, main, P2P, STREAMING, IPV6 };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Error:', err);
+  });
+}
