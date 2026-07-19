@@ -316,6 +316,16 @@ describe('isExcludedCountry', () => {
   it('does not match exact prefix without dash', () => {
     assert.equal(isExcludedCountry('SECURE#1'), false);
   });
+
+  it('does not exclude regular SE/CH/IS-country servers (no dash — not Secure Core multihop)', () => {
+    // Only the multi-hop "SE-"/"CH-"/"IS-" prefix is excluded. A plain "SE#1" is a
+    // regular Swedish server and must remain in all.json. A regression broadening
+    // the check to a bare "SE"/"CH"/"IS" would silently drop every regular server
+    // in those countries from the published list.
+    assert.equal(isExcludedCountry('SE#1'), false);
+    assert.equal(isExcludedCountry('CH#1'), false);
+    assert.equal(isExcludedCountry('IS#1'), false);
+  });
 });
 
 describe('dedupeServers', () => {
@@ -404,6 +414,15 @@ describe('extractFeatures', () => {
     const result = extractFeatures(P2P);
     assert.equal(typeof result.P2P, 'boolean');
     assert.equal(typeof result.Streaming, 'boolean');
+  });
+
+  it('returns false for both flags when Features is missing/undefined', () => {
+    // Defensive data validation: a logical server missing the Features field must
+    // not crash or mislabel. (undefined & N) === 0 yields no flags. A refactor
+    // that stopped tolerating a missing field would throw on every such entry.
+    const result = extractFeatures(undefined);
+    assert.equal(result.P2P, false);
+    assert.equal(result.Streaming, false);
   });
 });
 
@@ -949,5 +968,53 @@ describe('main', () => {
   it('rejects when the input file is not valid JSON (errors are not silently swallowed)', async () => {
     readFileSyncMock.mock.mockImplementation(() => 'not-valid-json{');
     await assert.rejects(main(), SyntaxError);
+  });
+
+  it('propagates file-read errors (e.g. missing response.json) instead of swallowing them', async () => {
+    // Pins the error-propagation contract for a distinct error class from JSON
+    // parse failures: a thrown readFileSync (ENOENT etc.) must reach the top-level
+    // .catch rather than be silently turned into empty/garbage output.
+    readFileSyncMock.mock.mockImplementation(() => {
+      throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+    });
+    await assert.rejects(main(), (err) => err.code === 'ENOENT');
+  });
+
+  it('still writes per-baseName files for Secure Core entries even though they are excluded from all.json', async () => {
+    // grouped[baseName].push(entryObj) is UNCONDITIONAL; only allEntries.push()
+    // is gated by isExcludedCountry. A regression that moved the grouped push
+    // inside the exclusion guard would silently delete every Secure Core
+    // per-country file with no signal. Also pins multi-hop baseName grouping:
+    // CH-US#1 and CH-US#2 both collapse to baseName "CH-US" and share one file.
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'CH-US#1',
+          Domain: 'ch-us-1.protonvpn.net',
+          City: 'Zurich',
+          Features: 0,
+          Servers: [{ Domain: 'ch-us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.2', ExitIP: '10.0.0.2' }]
+        },
+        {
+          Name: 'CH-US#2',
+          Domain: 'ch-us-2.protonvpn.net',
+          City: 'Zurich',
+          Features: 0,
+          Servers: [{ Domain: 'ch-us-2s.protonvpn.net', X25519PublicKey: 'k2', EntryIP: '10.0.0.2', ExitIP: '10.0.0.2' }]
+        }
+      ]
+    }));
+    await main();
+
+    const chUsPath = Object.keys(writtenFiles.files).find(p => p === path.join('outputs', 'CH-US.json'));
+    assert.ok(chUsPath, 'Secure Core per-baseName file outputs/CH-US.json should still be written');
+    const chUsData = JSON.parse(writtenFiles.files[chUsPath]);
+    assert.equal(chUsData.length, 2, 'both CH-US#1 and CH-US#2 should be grouped under baseName CH-US');
+    assert.deepEqual(chUsData.map(e => e.Name), ['CH-US#1', 'CH-US#2']);
+
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    assert.ok(allJsonPath);
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    assert.deepEqual(allData.data, [], 'Secure Core entries must remain excluded from all.json');
   });
 });
