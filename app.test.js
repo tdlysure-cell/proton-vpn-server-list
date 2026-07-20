@@ -1017,4 +1017,106 @@ describe('main', () => {
     const allData = JSON.parse(writtenFiles.files[allJsonPath]);
     assert.deepEqual(allData.data, [], 'Secure Core entries must remain excluded from all.json');
   });
+
+  it('creates only the missing directory when outputs exists but output-group does not', async () => {
+    // The two existsSync/mkdirSync checks are independent. The existing tests use a
+    // uniform mock (both missing -> mkdir x2, both present -> mkdir x0). This pins
+    // the mixed case: if outputs/ already exists but output-group/ does not, only
+    // output-group is created. A regression that tied the second mkdir to the first
+    // check (e.g. mkdir both only when outputs is missing) would leave output-group
+    // absent and the subsequent writeFileSync('output-group/all.json') would throw
+    // ENOENT -- the S3 publish step would fail with no test signal.
+    existsSyncMock.mock.mockImplementation((p) => p === 'outputs');
+    await main();
+    assert.equal(mkdirSyncMock.mock.callCount(), 1);
+    assert.equal(mkdirSyncMock.mock.calls[0].arguments[0], 'output-group');
+  });
+
+  it('creates only the missing directory when output-group exists but outputs does not', async () => {
+    // Symmetric counterpart: output-group present, outputs missing -> only outputs
+    // is created. Pins the independence of the checks in the other direction.
+    existsSyncMock.mock.mockImplementation((p) => p === 'output-group');
+    await main();
+    assert.equal(mkdirSyncMock.mock.callCount(), 1);
+    assert.equal(mkdirSyncMock.mock.calls[0].arguments[0], 'outputs');
+  });
+
+  it('fully processes Secure Core entries (features, dedup, ipv6) in per-baseName files', async () => {
+    // The exclusion check only gates allEntries.push; entryObj is built with the
+    // full pipeline (extractFeatures, dedupeServers, checkIPv6Enabled) for every
+    // entry before that check. The existing SC test only asserts names/count of
+    // outputs/CH-US.json. This pins that Secure Core per-country files are
+    // well-formed: a regression that skipped processing for excluded countries
+    // would silently publish malformed SC files (missing flags, un-deduped
+    // servers, wrong ipv6Enabled) with no signal.
+    resolve6Mock.mock.mockImplementation(async (d) => d === 'ch-us-1.protonvpn.net' ? ['2001:db8::1'] : []);
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'CH-US#1',
+          Domain: 'ch-us-1.protonvpn.net',
+          City: 'Zurich',
+          Features: 4,
+          Servers: [
+            { Domain: 'ch-us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.2', ExitIP: '10.0.0.2' },
+            { Domain: 'ch-us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.2', ExitIP: '10.0.0.2' }
+          ]
+        }
+      ]
+    }));
+    await main();
+
+    const chPath = Object.keys(writtenFiles.files).find(p => p === path.join('outputs', 'CH-US.json'));
+    assert.ok(chPath, 'Secure Core per-baseName file should be written');
+    const chData = JSON.parse(writtenFiles.files[chPath]);
+    assert.equal(chData[0].P2P, true, 'P2P flag must be extracted for Secure Core entries');
+    assert.equal(chData[0].Streaming, false);
+    assert.equal(chData[0].ipv6Enabled, true, 'ipv6Enabled must be computed for Secure Core entries');
+    assert.equal(chData[0].Servers.length, 1, 'duplicate physical servers must be deduped for Secure Core entries');
+    assert.equal(chData[0].Servers[0].Domain, 'ch-us-1s.protonvpn.net');
+
+    const allJsonPath = Object.keys(writtenFiles.files).find(p => p.includes('all.json'));
+    const allData = JSON.parse(writtenFiles.files[allJsonPath]);
+    assert.deepEqual(allData.data, [], 'Secure Core entry must still be excluded from all.json');
+  });
+
+  it('publishes a fully-formed entry in all.json (end-to-end schema of the S3-published artifact)', async () => {
+    // all.json is the artifact gzipped and uploaded by the S3 workflow. Its per-IP
+    // entry shape is produced by the full pipeline: extractFeatures -> entryObj ->
+    // groupByIPv4 -> sortByCity -> all.json. The individual stages are unit-tested,
+    // but no single test pins the composed published schema. A regression in any
+    // stage's field mapping (e.g. groupByIPv4 reading entry.p2p instead of entry.P2P,
+    // or dropping the domain/ipv6 field) would silently change the published list.
+    // This asserts every field of a single all.json entry end-to-end.
+    resolve4Mock.mock.mockImplementation(async (d) => d === 'us-1s.protonvpn.net' ? ['10.0.0.1'] : ['10.0.0.9']);
+    resolve6Mock.mock.mockImplementation(async (d) => d === 'us-1s.protonvpn.net' ? ['2001:db8::1'] : []);
+    readFileSyncMock.mock.mockImplementation(() => JSON.stringify({
+      LogicalServers: [
+        {
+          Name: 'US#1',
+          Domain: 'us-1.protonvpn.net',
+          City: 'New York',
+          Features: 4 | 8,
+          Servers: [
+            { Domain: 'us-1s.protonvpn.net', X25519PublicKey: 'k1', EntryIP: '10.0.0.1', ExitIP: '10.0.0.2' }
+          ]
+        }
+      ]
+    }));
+    await main();
+
+    const allPath = Object.keys(writtenFiles.files).find(p => p === path.join('output-group', 'all.json'));
+    assert.ok(allPath);
+    const allData = JSON.parse(writtenFiles.files[allPath]);
+    assert.equal(allData.data.length, 1, 'one physical server IP -> one all.json entry');
+    const entry = allData.data[0];
+    assert.equal(entry.ipv4, '10.0.0.1');
+    assert.equal(entry.ipv6, '2001:db8::1', 'ipv6 is the first AAAA of the physical server');
+    assert.equal(entry.domain, 'us-1s.protonvpn.net', 'domain is the physical server Domain');
+    assert.deepEqual(entry.servers, ['US#1']);
+    assert.equal(entry.city, 'New York');
+    assert.equal(entry.ipv6Enabled, true, 'ipv6Enabled true because a physical server has AAAA');
+    assert.equal(entry.P2P, true, 'P2P flag propagates from Features into all.json');
+    assert.equal(entry.Streaming, true, 'Streaming flag propagates from Features into all.json');
+  });
 });
